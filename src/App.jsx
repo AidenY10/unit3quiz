@@ -1,6 +1,14 @@
 import './App.css'
 import { useEffect, useMemo, useState } from 'react'
 import Papa from 'papaparse'
+import { auth, db } from './firebase'
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+} from 'firebase/auth'
+import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore'
 import {
   Area,
   AreaChart,
@@ -90,6 +98,17 @@ function groupByMonth(records, filters, metricKey) {
 }
 
 function SalesDashboard() {
+  const [currentUser, setCurrentUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authError, setAuthError] = useState('')
+  const [authModeLogin, setAuthModeLogin] = useState(true)
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [userVote, setUserVote] = useState(null)
+  const [voteBusy, setVoteBusy] = useState(false)
+  const [voteJustCast, setVoteJustCast] = useState(null)
+
   const [rawRows, setRawRows] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -98,6 +117,32 @@ function SalesDashboard() {
   const [yearFilter, setYearFilter] = useState('ALL')
   const [metric, setMetric] = useState('retailSales')
   const [showAllSeries, setShowAllSeries] = useState(true)
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user)
+      setAuthLoading(false)
+      setAuthError('')
+      setUserVote(null)
+
+      if (user) {
+        try {
+          const voteRef = doc(db, 'votes', user.uid)
+          const snap = await getDoc(voteRef)
+          if (snap.exists()) {
+            const data = snap.data()
+            if (data && data.vote) {
+              setUserVote(data.vote)
+            }
+          }
+        } catch (err) {
+          console.error('Error loading vote', err)
+        }
+      }
+    })
+
+    return () => unsubscribe()
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -199,6 +244,65 @@ function SalesDashboard() {
 
   const activeMetric = METRIC_CONFIG[metric]
 
+  async function handleAuthSubmit(event) {
+    event.preventDefault()
+    if (!email || !password) {
+      setAuthError('Please enter both email and password.')
+      return
+    }
+    setAuthBusy(true)
+    setAuthError('')
+    try {
+      if (authModeLogin) {
+        await signInWithEmailAndPassword(auth, email, password)
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password)
+      }
+    } catch (err) {
+      console.error(err)
+      let message = 'Something went wrong. Please try again.'
+      if (err.code === 'auth/user-not-found') {
+        message = 'No account found for this email.'
+      } else if (err.code === 'auth/wrong-password') {
+        message = 'Incorrect password. Try again.'
+      } else if (err.code === 'auth/email-already-in-use') {
+        message = 'An account already exists for this email.'
+      } else if (err.code === 'auth/weak-password') {
+        message = 'Password should be at least 6 characters.'
+      }
+      setAuthError(message)
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function handleVote(choice) {
+    if (!currentUser || userVote || voteBusy) return
+    setVoteBusy(true)
+    try {
+      const voteRef = doc(db, 'votes', currentUser.uid)
+      const existing = await getDoc(voteRef)
+      if (existing.exists()) {
+        const data = existing.data()
+        if (data && data.vote) {
+          setUserVote(data.vote)
+          return
+        }
+      }
+      await setDoc(voteRef, {
+        vote: choice,
+        createdAt: serverTimestamp(),
+        email: currentUser.email ?? null,
+      })
+      setUserVote(choice)
+      setVoteJustCast(choice)
+    } catch (err) {
+      console.error('Error saving vote', err)
+    } finally {
+      setVoteBusy(false)
+    }
+  }
+
   return (
     <main className="app-root">
       <div className="app-shell">
@@ -212,9 +316,122 @@ function SalesDashboard() {
 
         <section className="glass-panel" aria-label="Sales analytics dashboard">
           <div className="glass-inner">
-            <div className="chart-card">
+            <div>
+              <div className="auth-card" aria-label="Login and vote">
+                <div className="auth-header">
+                  <div>
+                    <div className="auth-title">Sign in &amp; cast your vote</div>
+                    <p className="auth-tagline">
+                      Use email and password. Once you vote, your choice is locked in.
+                    </p>
+                  </div>
+                  <div className="auth-mode-toggle">
+                    {authModeLogin ? 'Need an account?' : 'Already registered?'}{' '}
+                    <button type="button" onClick={() => setAuthModeLogin((v) => !v)}>
+                      {authModeLogin ? 'Create one' : 'Sign in'}
+                    </button>
+                  </div>
+                </div>
+
+                {!authLoading && !currentUser && (
+                  <form onSubmit={handleAuthSubmit}>
+                    <div className="auth-form-row">
+                      <div className="auth-field">
+                        <input
+                          type="email"
+                          className="auth-input"
+                          placeholder="you@example.com"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          autoComplete="email"
+                          required
+                        />
+                      </div>
+                      <div className="auth-field">
+                        <input
+                          type="password"
+                          className="auth-input"
+                          placeholder="Password"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          autoComplete={authModeLogin ? 'current-password' : 'new-password'}
+                          required
+                        />
+                      </div>
+                      <button className="auth-submit" type="submit" disabled={authBusy}>
+                        {authBusy
+                          ? authModeLogin
+                            ? 'Signing in…'
+                            : 'Creating account…'
+                          : authModeLogin
+                            ? 'Sign in'
+                            : 'Create account'}
+                      </button>
+                    </div>
+                    {authError && <p className="auth-error">{authError}</p>}
+                  </form>
+                )}
+
+                {!authLoading && currentUser && (
+                  <div className="auth-status">
+                    Signed in as <strong>{currentUser.email}</strong>.{' '}
+                    <button
+                      type="button"
+                      className="auth-submit"
+                      style={{ paddingInline: '0.8rem', fontSize: '0.76rem' }}
+                      onClick={() => signOut(auth)}
+                    >
+                      Sign out
+                    </button>
+                  </div>
+                )}
+
+                {authLoading && <p className="auth-status">Checking sign-in status…</p>}
+
+                {currentUser && (
+                  <div className="vote-card">
+                    <div className="vote-header">Your one-time vote</div>
+                    {!userVote && (
+                      <>
+                        <p className="vote-helper">
+                          Choose <strong>Yay</strong> or <strong>Nay</strong>. Once saved, this vote
+                          cannot be changed.
+                        </p>
+                        <div className="vote-buttons">
+                          <button
+                            type="button"
+                            className="vote-button yay"
+                            disabled={voteBusy}
+                            onClick={() => handleVote('yay')}
+                          >
+                            Yay
+                          </button>
+                          <button
+                            type="button"
+                            className="vote-button nay"
+                            disabled={voteBusy}
+                            onClick={() => handleVote('nay')}
+                          >
+                            Nay
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    {userVote && (
+                      <p className={`vote-result ${userVote === 'nay' ? 'nay' : 'yay'}`}>
+                        Your one-time vote
+                        <br />
+                        You voted <strong>{userVote.toUpperCase()}</strong>. Thank you — your vote
+                        is locked in and cannot be changed.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="chart-card">
               <div className="chart-header">
-                <div>
+      <div>
                   <div className="chart-title">Monthly Volume by Channel</div>
                 </div>
                 <span className="chart-pill">
@@ -350,6 +567,7 @@ function SalesDashboard() {
                   </ResponsiveContainer>
                 )}
               </div>
+              </div>
             </div>
 
             <aside className="sidebar" aria-label="Segmentation and settings">
@@ -463,7 +681,7 @@ function SalesDashboard() {
                 </div>
               </div>
             </aside>
-          </div>
+      </div>
 
           <footer className="intent-footer">
             <p>
@@ -478,6 +696,23 @@ function SalesDashboard() {
             </p>
           </footer>
         </section>
+        {voteJustCast && (
+          <div className="vote-modal-backdrop" role="alertdialog" aria-modal="true">
+            <div className={`vote-modal ${voteJustCast === 'yay' ? 'yay' : 'nay'}`}>
+              <h2 className="vote-modal-title">
+                You voted {voteJustCast.toUpperCase()}!
+              </h2>
+              <p className="vote-modal-text">Thanks for your support!</p>
+              <button
+                type="button"
+                className="vote-modal-button"
+                onClick={() => setVoteJustCast(null)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </main>
   )
